@@ -1,6 +1,9 @@
 package ly.img.postcardcollage
 
 import android.net.Uri
+import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.Spring
+import androidx.compose.animation.core.spring
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -38,10 +41,12 @@ import androidx.compose.material3.Slider
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.State
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -59,6 +64,7 @@ import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.util.lerp
 import androidx.compose.ui.zIndex
 import androidx.lifecycle.SavedStateHandle
 import androidx.lifecycle.ViewModel
@@ -66,6 +72,7 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.navigation.toRoute
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
 import kotlinx.serialization.Serializable
 import ly.img.editor.DesignEditor
@@ -135,14 +142,30 @@ fun CollageEditor(
                         .fillMaxSize()
                 ) {
 
-                    var invalidatePositions by remember { mutableStateOf(System.currentTimeMillis()) }
-                    val placeholderPositions by remember(invalidatePositions) {
-                        derivedStateOf {
-                            val engine = editorContext.engine
-                            val placeholders = engine.getPlaceholders()
-                            placeholders.map { block ->
+                    val placeholderPositions: MutableList<Pair<DesignBlock, Rect>> = remember {
+                        mutableStateListOf()
+                    }
+
+                    LaunchedEffect(Unit) {
+                        val engine = editorContext.engine
+                        fun invalidatePositions() {
+                            engine.getPlaceholders().map { block ->
                                 block to engine.getGlobalRect(density, block)
+                            }.let {
+                                placeholderPositions.clear()
+                                placeholderPositions.addAll(it)
                             }
+                        }
+
+                        scope.launch {
+                            invalidatePositions()
+                            engine.event
+                                .subscribe(
+                                    engine.getPlaceholders() + engine.getCamera()
+                                )
+                                .collect { _ ->
+                                    invalidatePositions()
+                                }
                         }
                     }
 
@@ -179,13 +202,13 @@ fun CollageEditor(
                                             }.find { (_, rect) ->
                                                 rect.contains(currentOffset)
                                             }?.let { (block, _) ->
-                                                engine.swapBlockPositions(currentBlock, block)
+                                                scope.launch {
+                                                    engine.swapBlockPositions(currentBlock, block)
+                                                }
                                             }
 
                                             currentDragArea = Rect.Zero
                                             currentOffset = Offset.Zero
-
-                                            invalidatePositions = System.currentTimeMillis()
 
                                         },
                                         onDrag = { change, dragAmount ->
@@ -245,12 +268,12 @@ fun CollageEditor(
                                 id = EditorComponentId("reorder_confirmation"),
                                 scope = Dock.ItemScope(this),
                             ) {
-                                Row (
+                                Row(
                                     Modifier
                                         .padding(horizontal = 12.dp)
                                         .fillMaxSize(),
                                     verticalAlignment = Alignment.CenterVertically
-                                )  {
+                                ) {
                                     Text("Long press & drag to reorder")
                                     Spacer(Modifier.width(64.dp))
 
@@ -766,7 +789,7 @@ fun Engine.getPlaceholders() = this
         this.block.getType(it) == DesignBlockType.Graphic.key
     }
 
-fun Engine.swapBlockPositions(currentBlock: DesignBlock, block: DesignBlock) {
+suspend fun Engine.swapBlockPositions(currentBlock: DesignBlock, block: DesignBlock) {
     if (currentBlock == block) return
     val originX = this.block.getPositionX(currentBlock)
     val originY = this.block.getPositionY(currentBlock)
@@ -778,15 +801,23 @@ fun Engine.swapBlockPositions(currentBlock: DesignBlock, block: DesignBlock) {
     val targetWidth = this.block.getWidth(block)
     val targetHeight = this.block.getHeight(block)
 
-    this.block.setPositionX(currentBlock, targetX)
-    this.block.setPositionY(currentBlock, targetY)
-    this.block.setWidth(currentBlock, targetWidth)
-    this.block.setHeight(currentBlock, targetHeight)
+    val animation = Animatable(0f)
+    val engine = this
+    animation.animateTo(
+        targetValue = 1f,
+        animationSpec = spring(dampingRatio = Spring.DampingRatioLowBouncy),
+        block = {
+            engine.block.setPositionX(currentBlock, lerp(originX, targetX, value))
+            engine.block.setPositionY(currentBlock, lerp(originY, targetY, value))
+            engine.block.setWidth(currentBlock, lerp(originWidth, targetWidth, value))
+            engine.block.setHeight(currentBlock, lerp(originHeight, targetHeight, value))
 
-    this.block.setPositionX(block, originX)
-    this.block.setPositionY(block, originY)
-    this.block.setWidth(block, originWidth)
-    this.block.setHeight(block, originHeight)
+            engine.block.setPositionX(block, lerp(targetX, originX, value))
+            engine.block.setPositionY(block, lerp(targetY, originY, value))
+            engine.block.setWidth(block, lerp(targetWidth, originWidth, value))
+            engine.block.setHeight(block, lerp(targetHeight, originHeight, value))
+        }
+    )
 }
 
 fun Engine.getGlobalRect(density: Density, block: DesignBlock): Rect {
@@ -816,4 +847,8 @@ class EditorViewModel(
     savedStateHandle: SavedStateHandle,
 ) : ViewModel() {
     val editorPayload = savedStateHandle.toRoute<EditorPayload>()
+}
+
+fun Engine.getCamera(): DesignBlock {
+    return block.findByType(DesignBlockType.Camera).first()
 }
