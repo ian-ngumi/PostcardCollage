@@ -7,7 +7,11 @@ import androidx.compose.animation.core.spring
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.awaitLongPressOrCancellation
+import androidx.compose.foundation.gestures.detectTransformGestures
+import androidx.compose.foundation.gestures.drag
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -28,22 +32,18 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.BorderStyle
-import androidx.compose.material.icons.rounded.Cancel
-import androidx.compose.material.icons.rounded.CheckCircle
 import androidx.compose.material.icons.rounded.EmojiEmotions
 import androidx.compose.material.icons.rounded.FormatColorFill
 import androidx.compose.material.icons.rounded.GridView
-import androidx.compose.material.icons.rounded.SwapVerticalCircle
 import androidx.compose.material3.Icon
-import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Slider
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.ReadOnlyComposable
 import androidx.compose.runtime.State
-import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateListOf
@@ -54,25 +54,30 @@ import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.toArgb
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.input.pointer.positionChange
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.util.lerp
-import androidx.compose.ui.zIndex
 import androidx.lifecycle.SavedStateHandle
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.navigation.toRoute
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
-import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 import kotlinx.serialization.Serializable
 import ly.img.editor.DesignEditor
@@ -108,9 +113,12 @@ fun CollageEditor(
 
     val viewModel = viewModel<EditorViewModel>()
 
+    var engine: Engine? by remember { mutableStateOf(null) }
+
     val config = EngineConfiguration.remember(
         license = Secrets.LICENSE,
         onCreate = {
+            engine = editorContext.engine
             EditorDefaults.onCreate(
                 engine = editorContext.engine,
                 eventHandler = editorContext.eventHandler,
@@ -127,512 +135,535 @@ fun CollageEditor(
         }
     )
 
-    var reorderMode by remember { mutableStateOf(false) }
 
+    val density = LocalDensity.current
     val editorConfiguration = EditorConfiguration.rememberForDesign(
         overlay = {
-            var currentDragArea by remember { mutableStateOf(Rect.Zero) }
-            val density = LocalDensity.current
+            var selectedBlock: DesignBlock? by remember {
+                mutableStateOf(null)
+            }
+            var selectedRegion by remember {
+                mutableStateOf(Rect.Zero)
+            }
 
-            if (reorderMode) {
+            LaunchedEffect(engine) {
+                val engine = engine ?: return@LaunchedEffect
+                engine.block.onSelectionChanged()
+                    .map { engine.block.findAllSelected() }
+                    .collect {
+                        println("Selected $it")
+                        it.firstOrNull()?.let {
+                            selectedBlock = it
+                            selectedRegion = engine.getGlobalRect(density = density, it)
+                        } ?: kotlin.run {
+                            selectedBlock = null
+                            selectedRegion = Rect.Zero
+                        }
+                    }
+            }
+            Box(
+                Modifier
+                    .statusBarsPadding()
+                    .fillMaxSize()
+            ) {
                 Box(
                     modifier = Modifier
-                        .zIndex(0f)
-                        .statusBarsPadding()
-                        .fillMaxSize()
-                ) {
+                        .applyRectDimensions(selectedRegion)
+                        .pointerInput(Unit) {
+                            detectTransformGestures(
+                                panZoomLock = false
+                            ) { centroid, pan, zoom, rotation ->
+                                val engine = engine ?: return@detectTransformGestures
+                                selectedBlock?.let { block ->
+                                    if (engine.block.supportsCrop(block)) {
+                                        /**
+                                         * Collect gesture data and apply it if we have a block
+                                         * currently selected
+                                         */
 
-                    val placeholderPositions: MutableList<Pair<DesignBlock, Rect>> = remember {
-                        mutableStateListOf()
-                    }
+                                        engine.block.setCropRotation(
+                                            block,
+                                            engine.block.getCropRotation(block) + (rotation * (Math.PI / 180f)).toFloat()
+                                        )
 
-                    LaunchedEffect(Unit) {
-                        val engine = editorContext.engine
-                        fun invalidatePositions() {
-                            engine.getPlaceholders().map { block ->
-                                block to engine.getGlobalRect(density, block)
-                            }.let {
-                                placeholderPositions.clear()
-                                placeholderPositions.addAll(it)
+                                        engine.block.setCropScaleRatio(
+                                            block,
+                                            engine.block.getCropScaleRatio(block) - (1f - zoom)
+                                        )
+
+                                        engine.block.setCropTranslationX(
+                                            block,
+                                            engine.block.getCropTranslationX(
+                                                block
+                                            ) + (with(density) { pan.x.toDp().value } / size.width)
+                                        )
+
+                                        engine.block.setCropTranslationY(
+                                            block,
+                                            engine.block.getCropTranslationY(
+                                                block
+                                            ) + (with(density) { pan.y.toDp().value } / size.height)
+                                        )
+
+                                        /**
+                                         * This is to ensure that the crop gestures do not cause the image
+                                         * to go off-screen
+                                         */
+                                        engine.block.adjustCropToFillFrame(
+                                            block,
+                                            engine.block.getCropScaleRatio(block)
+                                        )
+                                    }
+                                }
                             }
                         }
-
-                        scope.launch {
-                            invalidatePositions()
-                            engine.event
-                                .subscribe(
-                                    engine.getPlaceholders() + engine.getCamera()
-                                )
-                                .collect { _ ->
-                                    invalidatePositions()
-                                }
-                        }
-                    }
-
-                    placeholderPositions.forEach { (currentBlock, position) ->
-                        Box(
-                            modifier = Modifier
-                                .offset {
-                                    IntOffset(
-                                        position.left.roundToInt(),
-                                        position.top.roundToInt()
-                                    )
-                                }
-                                .width(with(LocalDensity.current) { position.width.toDp() })
-                                .height(with(LocalDensity.current) { position.height.toDp() })
-                                .border(
-                                    width = 2.dp,
-                                    color = Color.Red.copy(alpha = .7f),
-                                    shape = RoundedCornerShape(size = cornerRadius.floatValue.dp * 2)
-                                )
-                                .pointerInput(position) {
-                                    val engine = editorContext.engine
-
-                                    var currentOffset = Offset.Zero
-                                    detectDragGesturesAfterLongPress(
-                                        onDragStart = { touchOffset ->
-                                            currentOffset =
-                                                touchOffset + Offset(position.left, position.top)
-                                            currentDragArea = position
-                                        },
-                                        onDragEnd = {
-                                            val placeholders = engine.getPlaceholders()
-                                            placeholders.map { block ->
-                                                block to engine.getGlobalRect(density, block)
-                                            }.find { (_, rect) ->
-                                                rect.contains(currentOffset)
-                                            }?.let { (block, _) ->
-                                                scope.launch {
-                                                    engine.swapBlockPositions(currentBlock, block)
-                                                }
-                                            }
-
-                                            currentDragArea = Rect.Zero
-                                            currentOffset = Offset.Zero
-
-                                        },
-                                        onDrag = { change, dragAmount ->
-                                            currentOffset += dragAmount
-                                            currentDragArea = currentDragArea.copy(
-                                                left = currentDragArea.left + dragAmount.x,
-                                                top = currentDragArea.top + dragAmount.y,
-                                                right = currentDragArea.right + dragAmount.x,
-                                                bottom = currentDragArea.bottom + dragAmount.y,
-                                            )
-                                        }
-                                    )
-                                }
-                        )
-                    }
-
-
-                    if (!currentDragArea.isEmpty) {
-                        Box(
-                            modifier = Modifier
-                                .align(Alignment.TopStart)
-                                .offset {
-                                    IntOffset(
-                                        currentDragArea.left.roundToInt(),
-                                        currentDragArea.top.roundToInt()
-                                    )
-                                }
-                                .width(with(LocalDensity.current) { currentDragArea.width.toDp() })
-                                .height(with(LocalDensity.current) { currentDragArea.height.toDp() })
-                                .background(
-                                    color = Color.Red.copy(alpha = .2f),
-                                    shape = RoundedCornerShape(size = cornerRadius.floatValue.dp * 2)
-                                )
-                                .border(
-                                    width = 2.dp,
-                                    color = Color.Red.copy(alpha = .7f),
-                                    shape = RoundedCornerShape(size = cornerRadius.floatValue.dp * 2)
-                                )
-                        )
-                    }
-
-                }
+                )
             }
         },
         dock = {
             Dock.rememberForDesign(
-                horizontalArrangement = {
-                    if (reorderMode)
-                        Arrangement.Center
-                    else
-                        Arrangement.SpaceAround
-                },
-                listBuilder = if (reorderMode) {
-                    Dock.ListBuilder.remember {
-                        add {
-                            Dock.Custom.remember(
-                                id = EditorComponentId("reorder_confirmation"),
-                                scope = Dock.ItemScope(this),
-                            ) {
-                                Row(
-                                    Modifier
-                                        .padding(horizontal = 12.dp)
-                                        .fillMaxSize(),
-                                    verticalAlignment = Alignment.CenterVertically
-                                ) {
-                                    Text("Long press & drag to reorder")
-                                    Spacer(Modifier.width(64.dp))
-
-                                    IconButton(
-                                        onClick = {
-                                            reorderMode = false
-                                            editorContext.engine.editor.addUndoStep()
-                                            editorContext.engine.editor.undo()
-                                        }
-                                    ) {
-                                        Icon(
-                                            imageVector = Icons.Rounded.Cancel,
-                                            contentDescription = "Cancel Reorder"
-                                        )
-                                    }
-
-                                    IconButton(
-                                        onClick = {
-                                            editorContext.engine.editor.addUndoStep()
-                                            reorderMode = false
-                                        }
-                                    ) {
-                                        Icon(
-                                            imageVector = Icons.Rounded.CheckCircle,
-                                            contentDescription = "Apply Reorder"
-                                        )
-                                    }
-                                }
-                            }
-                        }
-                    }
-                } else {
-                    Dock.ListBuilder.remember {
-                        add {
-                            Dock.Button.remember(
-                                id = EditorComponentId("margin"),
-                                text = { Text("Margin") },
-                                icon = {
-                                    Icon(
-                                        imageVector = Icons.Rounded.BorderStyle,
-                                        contentDescription = null
-                                    )
-                                },
-                                onClick = {
-                                    editorContext.eventHandler.send(
-                                        EditorEvent.Sheet.Open(
-                                            SheetType.Custom(
-                                                style = SheetStyle(),
-                                                content = {
-                                                    Column(
-                                                        modifier = Modifier.padding(32.dp)
+                listBuilder =
+                Dock.ListBuilder.remember {
+                    add {
+                        Dock.Button.remember(
+                            id = EditorComponentId("margin"),
+                            text = { Text("Margin") },
+                            icon = {
+                                Icon(
+                                    imageVector = Icons.Rounded.BorderStyle,
+                                    contentDescription = null
+                                )
+                            },
+                            onClick = {
+                                editorContext.eventHandler.send(
+                                    EditorEvent.Sheet.Open(
+                                        SheetType.Custom(
+                                            style = SheetStyle(),
+                                            content = {
+                                                Column(
+                                                    modifier = Modifier.padding(32.dp)
+                                                ) {
+                                                    Row(
+                                                        verticalAlignment = Alignment.CenterVertically
                                                     ) {
-                                                        Row(
-                                                            verticalAlignment = Alignment.CenterVertically
-                                                        ) {
-                                                            Text(
-                                                                "Edit margins",
-                                                                style = MaterialTheme.typography.labelLarge
-                                                            )
+                                                        Text(
+                                                            "Edit margins",
+                                                            style = MaterialTheme.typography.labelLarge
+                                                        )
 
-                                                            Spacer(Modifier.weight(1f))
+                                                        Spacer(Modifier.weight(1f))
 
-                                                            TextButton(
-                                                                onClick = {
-                                                                    editorContext.eventHandler.send(
-                                                                        EditorEvent.Sheet.Close(true)
-                                                                    )
-                                                                }
-                                                            ) {
-                                                                Text("Done")
+                                                        TextButton(
+                                                            onClick = {
+                                                                editorContext.eventHandler.send(
+                                                                    EditorEvent.Sheet.Close(true)
+                                                                )
                                                             }
+                                                        ) {
+                                                            Text("Done")
                                                         }
-
-                                                        Spacer(Modifier.height(8.dp))
-
-                                                        Slider(
-                                                            value = margin.floatValue,
-                                                            onValueChange = {
-                                                                margin.floatValue = it
-                                                            },
-                                                            onValueChangeFinished = {
-                                                                editorContext.engine.editor.addUndoStep()
-                                                            },
-                                                            valueRange = 0f..10f
-                                                        )
-
-                                                        Spacer(Modifier.height(8.dp))
-
-                                                        Slider(
-                                                            value = cornerRadius.floatValue,
-                                                            onValueChange = {
-                                                                cornerRadius.floatValue = it
-                                                            },
-                                                            onValueChangeFinished = {
-                                                                editorContext.engine.editor.addUndoStep()
-                                                            },
-                                                            valueRange = 0f..20f
-                                                        )
-
-                                                        Spacer(Modifier.height(16.dp))
-
                                                     }
 
+                                                    Spacer(Modifier.height(8.dp))
+
+                                                    Slider(
+                                                        value = margin.floatValue,
+                                                        onValueChange = {
+                                                            margin.floatValue = it
+                                                        },
+                                                        onValueChangeFinished = {
+                                                            editorContext.engine.editor.addUndoStep()
+                                                        },
+                                                        valueRange = 0f..10f
+                                                    )
+
+                                                    Spacer(Modifier.height(8.dp))
+
+                                                    Slider(
+                                                        value = cornerRadius.floatValue,
+                                                        onValueChange = {
+                                                            cornerRadius.floatValue = it
+                                                        },
+                                                        onValueChangeFinished = {
+                                                            editorContext.engine.editor.addUndoStep()
+                                                        },
+                                                        valueRange = 0f..20f
+                                                    )
+
+                                                    Spacer(Modifier.height(16.dp))
+
                                                 }
-                                            )
+
+                                            }
                                         )
                                     )
-                                }
-                            )
-                        }
-
-
-
-                        add {
-                            Dock.Button.remember(
-                                id = EditorComponentId("layout"),
-                                text = { Text("Layout") },
-                                icon = {
-                                    Icon(
-                                        imageVector = Icons.Rounded.GridView,
-                                        contentDescription = null
-                                    )
-                                },
-                                onClick = {
-                                    editorContext.eventHandler.send(
-                                        EditorEvent.Sheet.Open(
-                                            SheetType.Custom(
-                                                style = SheetStyle(),
-                                                content = {
-                                                    Column(
-                                                        modifier = Modifier.padding(vertical = 32.dp)
+                                )
+                            }
+                        )
+                    }
+                    add {
+                        Dock.Button.remember(
+                            id = EditorComponentId("layout"),
+                            text = { Text("Layout") },
+                            icon = {
+                                Icon(
+                                    imageVector = Icons.Rounded.GridView,
+                                    contentDescription = null
+                                )
+                            },
+                            onClick = {
+                                editorContext.eventHandler.send(
+                                    EditorEvent.Sheet.Open(
+                                        SheetType.Custom(
+                                            style = SheetStyle(),
+                                            content = {
+                                                Column(
+                                                    modifier = Modifier.padding(vertical = 32.dp)
+                                                ) {
+                                                    Row(
+                                                        modifier = Modifier.padding(horizontal = 32.dp),
+                                                        verticalAlignment = Alignment.CenterVertically
                                                     ) {
-                                                        Row(
-                                                            modifier = Modifier.padding(horizontal = 32.dp),
-                                                            verticalAlignment = Alignment.CenterVertically
-                                                        ) {
-                                                            Text(
-                                                                "Edit layout",
-                                                                style = MaterialTheme.typography.labelLarge
-                                                            )
+                                                        Text(
+                                                            "Edit layout",
+                                                            style = MaterialTheme.typography.labelLarge
+                                                        )
 
-                                                            Spacer(Modifier.weight(1f))
+                                                        Spacer(Modifier.weight(1f))
 
-                                                            TextButton(
-                                                                onClick = {
-                                                                    editorContext.eventHandler.send(
-                                                                        EditorEvent.Sheet.Close(true)
-                                                                    )
-                                                                }
-                                                            ) {
-                                                                Text("Done")
-                                                            }
-                                                        }
-
-                                                        Spacer(Modifier.height(8.dp))
-
-                                                        Row(
-                                                            modifier = Modifier
-                                                                .fillMaxWidth()
-                                                                .height(100.dp)
-                                                                .horizontalScroll(
-                                                                    state = rememberScrollState()
+                                                        TextButton(
+                                                            onClick = {
+                                                                editorContext.eventHandler.send(
+                                                                    EditorEvent.Sheet.Close(true)
                                                                 )
-                                                                .padding(horizontal = 32.dp),
-                                                            horizontalArrangement = Arrangement.spacedBy(
-                                                                10.dp, Alignment.CenterHorizontally,
-                                                            )
+                                                            }
                                                         ) {
-                                                            collageLayouts.forEach {
-                                                                Column(
-                                                                    modifier = Modifier
-                                                                        .clickable {
-                                                                            editorContext.apply {
-                                                                                scope.launch {
-                                                                                    setLayout(
-                                                                                        scope,
-                                                                                        margin,
-                                                                                        cornerRadius,
-                                                                                        backgroundColor,
-                                                                                        Uri.parse(it.scene),
-                                                                                        imageUrls = viewModel.editorPayload.urls
-                                                                                    )
-                                                                                }
+                                                            Text("Done")
+                                                        }
+                                                    }
+
+                                                    Spacer(Modifier.height(8.dp))
+
+                                                    Row(
+                                                        modifier = Modifier
+                                                            .fillMaxWidth()
+                                                            .height(100.dp)
+                                                            .horizontalScroll(
+                                                                state = rememberScrollState()
+                                                            )
+                                                            .padding(horizontal = 32.dp),
+                                                        horizontalArrangement = Arrangement.spacedBy(
+                                                            10.dp, Alignment.CenterHorizontally,
+                                                        )
+                                                    ) {
+                                                        collageLayouts.forEach {
+                                                            Column(
+                                                                modifier = Modifier
+                                                                    .clickable {
+                                                                        editorContext.apply {
+                                                                            scope.launch {
+                                                                                setLayout(
+                                                                                    scope,
+                                                                                    margin,
+                                                                                    cornerRadius,
+                                                                                    backgroundColor,
+                                                                                    Uri.parse(it.scene),
+                                                                                    imageUrls = viewModel.editorPayload.urls
+                                                                                )
                                                                             }
                                                                         }
-                                                                        .fillMaxHeight()
-                                                                        .padding(
-                                                                            horizontal = 12.dp,
-                                                                            vertical = 8.dp
-                                                                        ),
-                                                                    verticalArrangement = Arrangement.Center,
-                                                                    horizontalAlignment = Alignment.CenterHorizontally
-                                                                ) {
-                                                                    it.GetIcon(Modifier.weight(1f))
-                                                                    Spacer(Modifier.height(4.dp))
-                                                                    Text(
-                                                                        it.name,
-                                                                        style = MaterialTheme.typography.labelSmall
-                                                                    )
-                                                                }
-                                                            }
-                                                        }
-
-                                                        Spacer(Modifier.height(16.dp))
-
-                                                    }
-
-                                                }
-                                            )
-                                        )
-                                    )
-                                }
-                            )
-                        }
-
-
-                        add {
-                            Dock.Button.remember(
-                                id = EditorComponentId("background-color"),
-                                text = { Text("Color") },
-                                icon = {
-                                    Icon(
-                                        imageVector = Icons.Rounded.FormatColorFill,
-                                        contentDescription = null
-                                    )
-                                },
-                                onClick = {
-                                    editorContext.eventHandler.send(
-                                        EditorEvent.Sheet.Open(
-                                            SheetType.Custom(
-                                                style = SheetStyle(),
-                                                content = {
-                                                    Column(
-                                                        modifier = Modifier.padding(32.dp)
-                                                    ) {
-                                                        Row(
-                                                            verticalAlignment = Alignment.CenterVertically
-                                                        ) {
-                                                            Text(
-                                                                "Change Background Color",
-                                                                style = MaterialTheme.typography.labelLarge
-                                                            )
-
-                                                            Spacer(Modifier.weight(1f))
-
-                                                            TextButton(
-                                                                onClick = {
-                                                                    editorContext.eventHandler.send(
-                                                                        EditorEvent.Sheet.Close(true)
-                                                                    )
-                                                                }
+                                                                    }
+                                                                    .fillMaxHeight()
+                                                                    .padding(
+                                                                        horizontal = 12.dp,
+                                                                        vertical = 8.dp
+                                                                    ),
+                                                                verticalArrangement = Arrangement.Center,
+                                                                horizontalAlignment = Alignment.CenterHorizontally
                                                             ) {
-                                                                Text("Done")
-                                                            }
-                                                        }
-
-                                                        Spacer(Modifier.height(8.dp))
-
-                                                        Row(
-                                                            modifier = Modifier
-                                                                .horizontalScroll(state = rememberScrollState())
-                                                                .fillMaxWidth(),
-                                                            horizontalArrangement = Arrangement.spacedBy(
-                                                                10.dp, Alignment.CenterHorizontally,
-                                                            )
-                                                        ) {
-                                                            listOf(
-                                                                Color.White,
-                                                                Color.Red,
-                                                                Color.Yellow,
-                                                                Color.Green,
-                                                                Color.Blue,
-                                                                Color.Magenta,
-                                                                Color.DarkGray,
-                                                            ).forEach {
-                                                                Box(
-                                                                    modifier = Modifier
-                                                                        .clickable {
-                                                                            backgroundColor.value =
-                                                                                it
-                                                                        }
-                                                                        .padding(4.dp)
-                                                                        .size(48.dp)
-                                                                        .background(it, CircleShape)
+                                                                it.GetIcon(Modifier.weight(1f))
+                                                                Spacer(Modifier.height(4.dp))
+                                                                Text(
+                                                                    it.name,
+                                                                    style = MaterialTheme.typography.labelSmall
                                                                 )
                                                             }
                                                         }
-
-                                                        Spacer(Modifier.height(16.dp))
-
                                                     }
 
+                                                    Spacer(Modifier.height(16.dp))
+
                                                 }
-                                            )
+
+                                            }
                                         )
                                     )
-                                }
-                            )
-                        }
+                                )
+                            }
+                        )
+                    }
+                    add {
+                        Dock.Button.remember(
+                            id = EditorComponentId("background-color"),
+                            text = { Text("Color") },
+                            icon = {
+                                Icon(
+                                    imageVector = Icons.Rounded.FormatColorFill,
+                                    contentDescription = null
+                                )
+                            },
+                            onClick = {
+                                editorContext.eventHandler.send(
+                                    EditorEvent.Sheet.Open(
+                                        SheetType.Custom(
+                                            style = SheetStyle(),
+                                            content = {
+                                                Column(
+                                                    modifier = Modifier.padding(32.dp)
+                                                ) {
+                                                    Row(
+                                                        verticalAlignment = Alignment.CenterVertically
+                                                    ) {
+                                                        Text(
+                                                            "Change Background Color",
+                                                            style = MaterialTheme.typography.labelLarge
+                                                        )
 
+                                                        Spacer(Modifier.weight(1f))
 
-                        add {
-                            Dock.Button.remember(
-                                id = EditorComponentId("stickers"),
-                                text = { Text("Stickers") },
-                                icon = {
-                                    Icon(
-                                        imageVector = Icons.Rounded.EmojiEmotions,
-                                        contentDescription = null
-                                    )
-                                },
-                                onClick = {
-                                    editorContext.eventHandler.send(
-                                        EditorEvent.Sheet.Open(
-                                            SheetType.LibraryAdd(
-                                                style = SheetStyle(),
-                                                libraryCategory = LibraryCategory.Stickers,
-                                            )
+                                                        TextButton(
+                                                            onClick = {
+                                                                editorContext.eventHandler.send(
+                                                                    EditorEvent.Sheet.Close(true)
+                                                                )
+                                                            }
+                                                        ) {
+                                                            Text("Done")
+                                                        }
+                                                    }
+
+                                                    Spacer(Modifier.height(8.dp))
+
+                                                    Row(
+                                                        modifier = Modifier
+                                                            .horizontalScroll(state = rememberScrollState())
+                                                            .fillMaxWidth(),
+                                                        horizontalArrangement = Arrangement.spacedBy(
+                                                            10.dp, Alignment.CenterHorizontally,
+                                                        )
+                                                    ) {
+                                                        listOf(
+                                                            Color.White,
+                                                            Color.Red,
+                                                            Color.Yellow,
+                                                            Color.Green,
+                                                            Color.Blue,
+                                                            Color.Magenta,
+                                                            Color.DarkGray,
+                                                        ).forEach {
+                                                            Box(
+                                                                modifier = Modifier
+                                                                    .clickable {
+                                                                        backgroundColor.value =
+                                                                            it
+                                                                    }
+                                                                    .padding(4.dp)
+                                                                    .size(48.dp)
+                                                                    .background(it, CircleShape)
+                                                            )
+                                                        }
+                                                    }
+
+                                                    Spacer(Modifier.height(16.dp))
+
+                                                }
+
+                                            }
                                         )
                                     )
-                                }
-                            )
-                        }
-
-                        add {
-                            Dock.Button.remember(
-                                id = EditorComponentId("reorder"),
-                                text = { Text("Reorder") },
-                                icon = {
-                                    Icon(
-                                        imageVector = Icons.Rounded.SwapVerticalCircle,
-                                        contentDescription = null
-                                    )
-                                },
-                                onClick = {
-                                    editorContext.engine.editor.addUndoStep()
-                                    reorderMode = !reorderMode
-                                }
-                            )
-                        }
-
-
+                                )
+                            }
+                        )
                     }
 
+
+                    add {
+                        Dock.Button.remember(
+                            id = EditorComponentId("stickers"),
+                            text = { Text("Stickers") },
+                            icon = {
+                                Icon(
+                                    imageVector = Icons.Rounded.EmojiEmotions,
+                                    contentDescription = null
+                                )
+                            },
+                            onClick = {
+                                editorContext.eventHandler.send(
+                                    EditorEvent.Sheet.Open(
+                                        SheetType.LibraryAdd(
+                                            style = SheetStyle(),
+                                            libraryCategory = LibraryCategory.Stickers,
+                                        )
+                                    )
+                                )
+                            }
+                        )
+                    }
                 }
             )
         }
     )
 
 
-    DesignEditor(
-        engineConfiguration = config,
-        editorConfiguration = editorConfiguration,
+    var currentDragArea by remember { mutableStateOf(Rect.Zero) }
+    var currentDragTarget by remember { mutableStateOf(Rect.Zero) }
+
+    val placeholderPositions: MutableList<Pair<DesignBlock, Rect>> = remember {
+        mutableStateListOf()
+    }
+
+    LaunchedEffect(engine) {
+        val engine = engine ?: return@LaunchedEffect
+        fun invalidatePositions() {
+            engine.getPlaceholders().map { block ->
+                block to engine.getGlobalRect(density, block)
+            }.let {
+                placeholderPositions.clear()
+                placeholderPositions.addAll(it)
+            }
+        }
+
+        scope.launch {
+            invalidatePositions()
+            engine.event
+                .subscribe(
+                    engine.getCamera()?.let {
+                        engine.getPlaceholders() + it
+                    } ?: engine.getPlaceholders()
+                )
+                .collect { _ ->
+                    invalidatePositions()
+                }
+        }
+    }
+
+    val hapticFeedback = LocalHapticFeedback.current
+
+    Box(
+        modifier = Modifier
+            .statusBarsPadding()
+            .pointerInput(Unit, engine) {
+                val engine = engine ?: return@pointerInput
+                awaitEachGesture {
+                    val event = awaitFirstDown(
+                        requireUnconsumed = false,
+                        pass = PointerEventPass.Final,
+                    )
+                    val position = event.position
+                    placeholderPositions.find { (_, rect) ->
+                        rect.contains(position)
+                    }?.let { (currentBlock, rect) ->
+                        awaitLongPressOrCancellation(event.id)?.let { longPress ->
+                            hapticFeedback.performHapticFeedback(HapticFeedbackType.LongPress)
+                            var currentOffset = position
+                            var currentBlockTarget = currentBlock
+                            currentDragArea = rect
+
+                            drag(longPress.id) { dragChange ->
+                                val dragAmount = dragChange.positionChange()
+                                currentOffset += dragAmount
+                                currentDragArea = currentDragArea.copy(
+                                    left = currentDragArea.left + dragAmount.x,
+                                    top = currentDragArea.top + dragAmount.y,
+                                    right = currentDragArea.right + dragAmount.x,
+                                    bottom = currentDragArea.bottom + dragAmount.y,
+                                )
+
+                                engine.getPlaceholders().map { block ->
+                                    block to engine.getGlobalRect(density, block)
+                                }.find { (_, rect) ->
+                                    rect.contains(currentOffset)
+                                }?.let { (block, rect) ->
+                                    if (currentBlockTarget != block) {
+                                        currentDragTarget = rect
+                                        hapticFeedback.performHapticFeedback(HapticFeedbackType.LongPress)
+                                        currentBlockTarget = block
+                                    }
+                                }
+
+                                dragChange.consume()
+                            }
+                            longPress.consume()
+
+                            engine.getPlaceholders().map { block ->
+                                block to engine.getGlobalRect(density, block)
+                            }.find { (_, rect) ->
+                                rect.contains(currentOffset)
+                            }?.let { (block, _) ->
+                                scope.launch {
+                                    hapticFeedback.performHapticFeedback(HapticFeedbackType.LongPress)
+                                    engine.swapBlockPositions(currentBlock, block)
+                                    hapticFeedback.performHapticFeedback(HapticFeedbackType.LongPress)
+                                    delay(10)
+                                    hapticFeedback.performHapticFeedback(HapticFeedbackType.LongPress)
+                                }
+                            }
+
+                            currentDragArea = Rect.Zero
+                            currentDragTarget = Rect.Zero
+                            currentOffset = Offset.Zero
+                        }
+                    }
+                }
+            }
     ) {
-        onClose()
+        DesignEditor(
+            engineConfiguration = config,
+            editorConfiguration = editorConfiguration,
+        ) {
+            onClose()
+        }
+
+
+        Box(
+            modifier = Modifier
+                .statusBarsPadding()
+                .fillMaxSize()
+        ) {
+            listOf(currentDragTarget, currentDragArea).forEach { rect ->
+                Box(
+                    modifier = Modifier
+                        .applyRectDimensions(rect)
+                        .background(
+                            color = Color(0xFF4A67FF).copy(alpha = .3f),
+                            shape = RoundedCornerShape(size = cornerRadius.floatValue.dp * 2)
+                        )
+                        .border(
+                            width = 2.dp,
+                            color = Color(0xFF4A67FF).copy(alpha = .7f),
+                            shape = RoundedCornerShape(size = cornerRadius.floatValue.dp * 2)
+                        )
+                )
+            }
+        }
+
     }
 
 }
 
+@ReadOnlyComposable
+@Composable
+fun Modifier.applyRectDimensions(rect: Rect) =
+    this
+        .alpha(if (rect.isEmpty) 0f else 1f)
+        .offset {
+            IntOffset(
+                rect.left.roundToInt(),
+                rect.top.roundToInt()
+            )
+        }
+        .width(with(LocalDensity.current) { rect.width.toDp() })
+        .height(with(LocalDensity.current) { rect.height.toDp() })
 
 private var resizerJob: Job? = null
 private suspend fun EditorScope.setLayout(
@@ -669,6 +700,7 @@ private suspend fun EditorScope.setLayout(
     val group = engine.block.group(imagePlaceholders)
 
     engine.block.setScopeEnabled(group, "editor/select", false)
+    engine.block.setScopeEnabled(group, "layer/move", false)
 
     val groupSize = Size(
         engine.block.getWidth(group),
@@ -816,6 +848,9 @@ suspend fun Engine.swapBlockPositions(currentBlock: DesignBlock, block: DesignBl
             engine.block.setPositionY(block, lerp(targetY, originY, value))
             engine.block.setWidth(block, lerp(targetWidth, originWidth, value))
             engine.block.setHeight(block, lerp(targetHeight, originHeight, value))
+
+            engine.block.setContentFillMode(currentBlock, ContentFillMode.COVER)
+            engine.block.setContentFillMode(block, ContentFillMode.COVER)
         }
     )
 }
@@ -849,6 +884,6 @@ class EditorViewModel(
     val editorPayload = savedStateHandle.toRoute<EditorPayload>()
 }
 
-fun Engine.getCamera(): DesignBlock {
-    return block.findByType(DesignBlockType.Camera).first()
+fun Engine.getCamera(): DesignBlock? {
+    return block.findByType(DesignBlockType.Camera).firstOrNull()
 }
