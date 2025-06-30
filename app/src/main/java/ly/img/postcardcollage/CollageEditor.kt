@@ -138,7 +138,11 @@ fun CollageEditor(
 
     val density = LocalDensity.current
     val editorConfiguration = EditorConfiguration.rememberForDesign(
-        overlay = {
+        overlay = { state ->
+            EditorDefaults.Overlay(
+                state = state,
+                eventHandler = editorContext.eventHandler
+            )
             var selectedBlock: DesignBlock? by remember {
                 mutableStateOf(null)
             }
